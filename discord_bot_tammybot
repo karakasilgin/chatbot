@@ -1,0 +1,382 @@
+#Library
+
+import discord
+from discord.ext import commands
+import asyncio
+import youtube_dl
+import random
+import os
+from collections import defaultdict
+import re
+
+# Suppress noise about console usage from errors
+youtube_dl.utils.bug_reports_message = lambda: ''
+
+# YouTube-dl options
+ytdl_format_options= {
+    'format' : 'bestaudio/best',
+    'outtmpl' :'%(extractor)s-%(id)s-%(title)s.%(ext)s',
+    'restrictfilenames': True ,
+    'noplaylist': True,
+    'nocheckcertificate': True,
+    'ignoreerrors': False,
+    'logtostderr': False,
+    'quiet': True,
+    'no_warnings': True,
+    'default_search': 'auto',
+    'source_address': '0.0.0.0'
+}
+
+ffmpeg_options = {
+    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
+    'options': '-vn'
+}
+
+ytdl = youtube_dl.YoutubeDL(ytdl_format_options)
+
+class YTDLSource(discord.PCMVolumeTransformer):
+    def __init__(self, source, *, data, volume=0.5):
+        super().__init__(source, volume)
+        self.data = data
+        self.title = data.get('title')
+        self.url = data.get('url')
+        self.duration = data.get('duration')
+        self.thumbnail = data.get('thumbnail')
+
+    @classmethod
+    async def from_url(cls, url, *, loop=None, stream=False):
+        loop = loop or asyncio.get_event_loop()
+        data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=not stream))
+        
+        if 'entries' in data:
+            data = data['entries'][0]
+        
+        filename = data['url'] if stream else ytdl.prepare_filename(data)
+        return cls(discord.FFmpegPCMAudio(filename, **ffmpeg_options), data=data)
+
+class MusicQueue:
+    def __init__(self):
+        self.queue = []
+        self.current = None
+        self.voice_client = None
+        
+    def add_song(self, song_info):
+        self.queue.append(song_info)
+    
+    def get_next(self):
+        if self.queue:
+            return self.queue.pop(0)
+        return None
+    
+    def clear(self):
+        self.queue.clear()
+        self.current = None
+
+class DiscordBot(commands.Bot):
+    def __init__(self):
+        intents = discord.Intents.default()
+        intents.message_content = True
+        intents.voice_states = True
+        
+        super().__init__(command_prefix='!', intents=intents)
+        
+        self.music_queues = defaultdict(MusicQueue)
+        self.games = {}  # Store active games per user
+        
+    async def on_ready(self):
+        print(f'🤖 {self.user} has connected to Discord!')
+        await self.change_presence(activity=discord.Activity(type=discord.ActivityType.listening, name="🎵 Music & Chat"))
+        
+        # Sync slash commands
+        try:
+            synced = await self.tree.sync()
+            print(f"✅ Synced {len(synced)} command(s)")
+        except Exception as e:
+            print(f"❌ Failed to sync commands: {e}")
+
+    async def on_message(self, message):
+        if message.author.bot:
+            return
+            
+        # Handle game guesses
+        if message.author.id in self.games and message.content.isdigit():
+            await self.handle_game_guess(message)
+            return
+            
+        # Handle conversations (non-command messages)
+        if not message.content.startswith(('!', '/')):
+            await self.handle_conversation(message)
+        
+        await self.process_commands(message)
+
+    async def handle_conversation(self, message):
+        content = message.content.lower()
+        
+        # Greetings
+        if any(word in content for word in ['hello', 'hi', 'hey']):
+            greetings = [
+                f"Hello {message.author.display_name}! 👋",
+                "Hey there! How can I help you today?",
+                "Hi! Ready for some music or games?",
+                "Hello! What's up?"
+            ]
+            await message.reply(random.choice(greetings))
+            
+        elif 'how are you' in content:
+            responses = [
+                "I'm doing great! Ready to play some music! 🎵",
+                "I'm awesome! What song should we listen to?",
+                "Feeling good and ready to chat or play games! 😊",
+                "I'm wonderful! Thanks for asking!"
+            ]
+            await message.reply(random.choice(responses))
+            
+        elif 'thank' in content:
+            await message.reply("You're welcome! Happy to help! 😊")
+            
+        elif any(word in content for word in ['music', 'song', 'play']):
+            await message.reply("🎵 Use `/play <song name>` to play music! I can search YouTube for any song you want!")
+            
+        elif 'game' in content:
+            await message.reply("🎮 Use `/game` to start a number guessing game! It's really fun!")
+            
+        elif 'help' in content:
+            embed = discord.Embed(
+                title="🤖 Bot Commands",
+                description="Here are all the things I can do:",
+                color=0x0099FF
+            )
+            embed.add_field(
+                name="🎵 Music Commands", 
+                value="`/play` - Play music\n`/skip` - Skip song\n`/stop` - Stop music\n`/queue` - Show queue", 
+                inline=False
+            )
+            embed.add_field(
+                name="💬 Chat Commands", 
+                value="`/chat` - Chat with me\nOr just talk normally!", 
+                inline=False
+            )
+            embed.add_field(
+                name="🎮 Game Commands", 
+                value="`/game` - Number guessing game", 
+                inline=False
+            )
+            await message.reply(embed=embed)
+            
+        else:
+            # Random conversation responses (70% chance to avoid spam)
+            if random.random() < 0.7:
+                responses = [
+                    "That's interesting! Tell me more! 🤔",
+                    "I see! Anything else on your mind?",
+                    "Cool! Want to listen to some music?",
+                    "Nice! How about we play a game?",
+                    "Awesome! I'm here if you need anything!",
+                    "That's great! What else is going on?"
+                ]
+                await message.reply(random.choice(responses))
+
+    async def handle_game_guess(self, message):
+        user_id = message.author.id
+        game = self.games[user_id]
+        guess = int(message.content)
+        
+        if not (1 <= guess <= 100):
+            await message.reply("Please guess a number between 1 and 100!")
+            return
+            
+        game['attempts'] += 1
+        
+        if guess == game['target']:
+            del self.games[user_id]
+            embed = discord.Embed(
+                title="🎉 Congratulations!",
+                description=f"You guessed it! The number was **{game['target']}**",
+                color=0x00FF00
+            )
+            embed.add_field(name="Attempts used", value=f"{game['attempts']}/{game['max_attempts']}")
+            await message.reply(embed=embed)
+            
+        elif game['attempts'] >= game['max_attempts']:
+            del self.games[user_id]
+            embed = discord.Embed(
+                title="💀 Game Over!",
+                description=f"You ran out of attempts! The number was **{game['target']}**",
+                color=0xFF0000
+            )
+            await message.reply(embed=embed)
+            
+        else:
+            hint = "higher" if guess < game['target'] else "lower"
+            attempts_left = game['max_attempts'] - game['attempts']
+            
+            embed = discord.Embed(
+                title="🎯 Keep trying!",
+                description=f"Your guess is too {hint}!",
+                color=0xFFA500
+            )
+            embed.add_field(name="Attempts left", value=str(attempts_left))
+            await message.reply(embed=embed)
+
+# Create bot instance
+bot = DiscordBot()
+
+# Music Commands
+@bot.tree.command(name="play", description="Play a song from YouTube")
+async def play(interaction: discord.Interaction, song: str):
+    if not interaction.user.voice:
+        await interaction.response.send_message("❌ You need to be in a voice channel!")
+        return
+        
+    await interaction.response.defer()
+    
+    try:
+        # Join voice channel if not already connected
+        if not interaction.guild.voice_client:
+            voice_channel = interaction.user.voice.channel
+            voice_client = await voice_channel.connect()
+        else:
+            voice_client = interaction.guild.voice_client
+            
+        queue = bot.music_queues[interaction.guild.id]
+        queue.voice_client = voice_client
+        
+        # Search and add song
+        try:
+            player = await YTDLSource.from_url(song, loop=bot.loop, stream=True)
+            song_info = {
+                'player': player,
+                'title': player.title,
+                'requester': interaction.user.display_name,
+                'thumbnail': player.thumbnail
+            }
+            
+            if voice_client.is_playing():
+                queue.add_song(song_info)
+                embed = discord.Embed(
+                    title="📝 Added to Queue",
+                    description=f"**{player.title}**",
+                    color=0xFFA500
+                )
+                embed.add_field(name="Position in queue", value=str(len(queue.queue)))
+                embed.add_field(name="Requested by", value=song_info['requester'])
+                if player.thumbnail:
+                    embed.set_thumbnail(url=player.thumbnail)
+                await interaction.followup.send(embed=embed)
+            else:
+                queue.current = song_info
+                voice_client.play(player, after=lambda e: bot.loop.create_task(play_next(interaction.guild.id)) if e else None)
+                
+                embed = discord.Embed(
+                    title="🎵 Now Playing",
+                    description=f"**{player.title}**",
+                    color=0x00FF00
+                )
+                embed.add_field(name="Requested by", value=song_info['requester'])
+                if player.thumbnail:
+                    embed.set_thumbnail(url=player.thumbnail)
+                await interaction.followup.send(embed=embed)
+                
+        except Exception as e:
+            await interaction.followup.send(f"❌ Error playing song: {str(e)}")
+            
+    except Exception as e:
+        await interaction.followup.send(f"❌ Could not join voice channel: {str(e)}")
+
+async def play_next(guild_id):
+    queue = bot.music_queues[guild_id]
+    if queue.queue:
+        next_song = queue.get_next()
+        queue.current = next_song
+        queue.voice_client.play(next_song['player'], after=lambda e: bot.loop.create_task(play_next(guild_id)) if e else None)
+
+@bot.tree.command(name="skip", description="Skip the current song")
+async def skip(interaction: discord.Interaction):
+    if interaction.guild.voice_client and interaction.guild.voice_client.is_playing():
+        interaction.guild.voice_client.stop()
+        await interaction.response.send_message("⏭️ Song skipped!")
+    else:
+        await interaction.response.send_message("❌ No music is playing!")
+
+@bot.tree.command(name="stop", description="Stop music and clear queue")
+async def stop(interaction: discord.Interaction):
+    if interaction.guild.voice_client:
+        queue = bot.music_queues[interaction.guild.id]
+        queue.clear()
+        await interaction.guild.voice_client.disconnect()
+        await interaction.response.send_message("⏹️ Music stopped and queue cleared!")
+    else:
+        await interaction.response.send_message("❌ No music is playing!")
+
+@bot.tree.command(name="queue", description="Show current music queue")
+async def show_queue(interaction: discord.Interaction):
+    queue = bot.music_queues[interaction.guild.id]
+    
+    if not queue.current and not queue.queue:
+        await interaction.response.send_message("❌ Queue is empty!")
+        return
+        
+    embed = discord.Embed(title="🎵 Music Queue", color=0x0099FF)
+    
+    description = ""
+    if queue.current:
+        description += f"▶️ **{queue.current['title']}** (Now Playing)\n"
+    
+    for i, song in enumerate(queue.queue[:9], 1):
+        description += f"{i}. **{song['title']}**\n"
+        
+    if len(queue.queue) > 9:
+        description += f"... and {len(queue.queue) - 9} more songs"
+        
+    embed.description = description
+    await interaction.response.send_message(embed=embed)
+
+# Game Commands
+@bot.tree.command(name="game", description="Start a number guessing game")
+async def start_game(interaction: discord.Interaction):
+    user_id = interaction.user.id
+    
+    if user_id in bot.games:
+        await interaction.response.send_message("🎮 You already have an active game! Guess a number between 1-100.")
+        return
+        
+    target_number = random.randint(1, 100)
+    bot.games[user_id] = {
+        'target': target_number,
+        'attempts': 0,
+        'max_attempts': 7
+    }
+    
+    embed = discord.Embed(
+        title="🎮 Number Guessing Game",
+        description="I'm thinking of a number between 1 and 100!",
+        color=0xFF6B6B
+    )
+    embed.add_field(name="How to play", value="Just type your guess as a regular message (not a command)", inline=False)
+    embed.add_field(name="Attempts left", value="7", inline=True)
+    
+    await interaction.response.send_message(embed=embed)
+
+# Chat Command
+@bot.tree.command(name="chat", description="Have a conversation with the bot")
+async def chat_command(interaction: discord.Interaction, message: str):
+    responses = [
+        f'"{message}" - That\'s really interesting! What made you think about that?',
+        f'I heard you say "{message}" - tell me more about it!',
+        f'Thanks for sharing: "{message}". I find that fascinating!',
+        f'"{message}" - I love chatting about stuff like this!',
+        f'You said "{message}" - that\'s cool! Anything else on your mind?'
+    ]
+    
+    await interaction.response.send_message(random.choice(responses))
+
+# Legacy text commands (optional)
+@bot.command(name='ping')
+async def ping(ctx):
+    await ctx.send(f'🏓 Pong! Latency: {round(bot.latency * 1000)}ms')
+
+# Run the bot ' add your own token'
+if __name__ == "__main__":
+    # Replace with your bot token
+    BOT_TOKEN = "YOUR_BOT_TOKEN"
+    bot.run(XXXXXX)
